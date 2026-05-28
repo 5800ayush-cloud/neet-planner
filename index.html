@@ -367,9 +367,97 @@ const Tag=({children,color="var(--g3)"})=>(
 );
 
 // - GEMINI API CALLER (FREE TIER) -
-const GROQ_KEY_STORE = "neet2028_claude_key";
-const getKey = ()=>{ try{return localStorage.getItem("neet2028_groq_key")||"";}catch(e){return "";} };
-const saveKey = k=>{ try{localStorage.setItem("neet2028_groq_key",k);}catch(e){} };
+const GEMINI_KEY_STORE = "neet2028_gemini_key";
+const getKey = ()=>{ try{return localStorage.getItem(GEMINI_KEY_STORE)||"";}catch(e){return "";} };
+const saveKey = k=>{ try{localStorage.setItem(GEMINI_KEY_STORE,k);}catch(e){} };
+
+// Standard AI Call (For Briefings & Analysis)
+async function callAI(systemPrompt, userPrompt){
+  const key = getKey();
+  if(!key) return offlineAI(userPrompt,{}).text;
+  
+  try{
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${key}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+        contents: [{ role: "user", parts: [{ text: userPrompt }] }],
+        generationConfig: { temperature: 0.7, maxOutputTokens: 1000 }
+      })
+    });
+    const raw = await res.json();
+    if(!res.ok) throw new Error(raw.error?.message || "HTTP " + res.status);
+    return raw.candidates?.[0]?.content?.parts?.[0]?.text || "";
+  }catch(e){
+    return offlineAI(userPrompt,{}).text;
+  }
+}
+
+// AI Call With Tools (For Chat & Actions)
+async function callAIWithTools(systemPrompt, messages, tools){
+  const key = getKey();
+  const lastMsg = messages.filter(m=>m.role==="user").slice(-1)[0]?.content||"";
+  if(!key){
+    const res = offlineAI(lastMsg,{tools});
+    return {text:res.text, toolCalls:res.toolCalls||[]};
+  }
+  
+  // Format tools into the system prompt for Gemini
+  const toolDesc = tools.map(t=>{
+    const props = Object.keys(t.input_schema.properties||{}).join(", ");
+    return "- "+t.name+": "+t.description+" | params: {"+props+"}";
+  }).join("\n");
+  
+  const fullSystem = systemPrompt+"\n\nTOOLS:\n"+toolDesc+"\n\nIF user gives a command output EXACTLY:\nACTIONS_START\n{\"actions\":[{\"tool\":\"tool_name\",\"params\":{...}}]}\nACTIONS_END\nThen reply. If no command just reply normally.";
+  
+  // Map standard messages (user/assistant) to Gemini format (user/model)
+  const geminiContents = [];
+  messages.filter(m=>m.role==="user"||m.role==="assistant").forEach(m=>{
+    geminiContents.push({
+      role: m.role === "assistant" ? "model" : "user",
+      parts: [{ text: typeof m.content === "string" ? m.content : JSON.stringify(m.content) }]
+    });
+  });
+
+  try{
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${key}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: fullSystem }] },
+        contents: geminiContents,
+        generationConfig: { temperature: 0.7, maxOutputTokens: 1200 }
+      })
+    });
+    const raw = await res.json();
+    if(!res.ok){
+      const offRes = offlineAI(lastMsg,{tools});
+      return {text:offRes.text, toolCalls:offRes.toolCalls||[]};
+    }
+    
+    let fullText = raw.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    const toolCalls=[];
+    
+    // Parse the injected command actions
+    const actStart = fullText.indexOf("ACTIONS_START");
+    const actEnd = fullText.indexOf("ACTIONS_END");
+    if(actStart !== -1 && actEnd !== -1){
+      try{
+        const parsed = JSON.parse(fullText.slice(actStart+13, actEnd).trim());
+        (parsed.actions||[]).forEach(a=>{
+          toolCalls.push({function:{name:a.tool,arguments:JSON.stringify(a.params||{})}});
+        });
+      }catch(e){}
+      fullText = (fullText.slice(0,actStart) + fullText.slice(actEnd+11)).trim();
+    }
+    return {text:fullText, toolCalls};
+  }catch(e){
+    const offRes = offlineAI(lastMsg,{tools});
+    return {text:offRes.text, toolCalls:offRes.toolCalls||[]};
+  }
+}
+
 // Offline ARIA - no model needed
 
 async function callAI(systemPrompt, userPrompt){
